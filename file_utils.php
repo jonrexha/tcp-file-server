@@ -68,3 +68,49 @@ function delete_file_safe($base_dir, $filename)
 
     return unlink($path);
 }
+
+function get_file_content($base_dir, $filename)
+{
+    $path = get_safe_file_path($base_dir, $filename);
+    if (!$path || !is_file($path)) {
+        return false;
+    }
+
+    return file_get_contents($path);
+}
+
+function get_file_detailed_info($base_dir, $filename)
+{
+    $path = get_safe_file_path($base_dir, $filename);
+    if (!$path || !is_file($path)) {
+        return false;
+    }
+
+    $info = format_file_info($path);
+    $info['path'] = $path;
+    $info['permissions'] = substr(sprintf('%o', fileperms($path)), -4);
+    $info['readable'] = is_readable($path);
+    $info['writable'] = is_writable($path);
+
+    return $info;
+}
+
+function validate_filename($filename)
+{
+    // Prevent directory traversal and invalid characters
+    if (preg_match('/\.\.|\/|\\\\/', $filename)) {
+        return false;
+    }
+
+    // Check length
+    if (strlen($filename) > 255) {
+        return false;
+    }
+
+    // Check for invalid characters
+    if (preg_match('/[<>:"|?*]/', $filename)) {
+        return false;
+    }
+
+    return true;
+}
