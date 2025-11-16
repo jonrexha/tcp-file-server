@@ -42,6 +42,16 @@ class UserAuthenticator {
             ];
         }
         
+        // Check if client is already authenticated
+        if (isset($this->user_sessions[$client_id])) {
+            $current_user = $this->user_sessions[$client_id]['username'];
+            log_message("Client #$client_id attempted re-authentication as '$username' (currently '$current_user')", 'WARNING');
+            return [
+                'success' => false,
+                'message' => "ERROR: Already authenticated as $current_user. Use /logout first."
+            ];
+        }
+        
         $role = 'read'; // Default role
         
         // Check for admin authentication
@@ -65,7 +75,8 @@ class UserAuthenticator {
             'username' => $username,
             'role' => $role,
             'authenticated_at' => time(),
-            'last_activity' => time()
+            'last_activity' => time(),
+            'client_id' => $client_id
         ];
         
         $message = "AUTH OK - Welcome $username! ";
@@ -81,7 +92,9 @@ class UserAuthenticator {
     public function update_activity($client_id) {
         if (isset($this->user_sessions[$client_id])) {
             $this->user_sessions[$client_id]['last_activity'] = time();
+            return true;
         }
+        return false;
     }
     
     public function get_user($client_id) {
@@ -117,7 +130,9 @@ class UserAuthenticator {
             'auth',    // Can authenticate
             'stats',   // Can view stats
             'echo',    // Can use echo functionality
-            'help'     // Can view help
+            'help',    // Can view help
+            'whoami',  // Can view own info
+            'logout'   // Can logout
         ];
         
         return in_array($permission, $read_permissions);
@@ -125,6 +140,15 @@ class UserAuthenticator {
     
     public function validate_command($client_id, $command) {
         if (!isset($this->user_sessions[$client_id])) {
+            // Check if this is a command that doesn't require authentication
+            $public_commands = ['auth', 'help', 'quit', 'exit'];
+            if (in_array($command, $public_commands)) {
+                return [
+                    'allowed' => true,
+                    'message' => "OK"
+                ];
+            }
+            
             return [
                 'allowed' => false,
                 'message' => "ERROR: Authentication required. Use /auth <username> [password]"
@@ -137,13 +161,21 @@ class UserAuthenticator {
         // Define admin-only commands
         $admin_commands = [
             'list', 'read', 'delete', 'search', 'info', 
-            'download', 'upload', 'shutdown', 'kick'
+            'download', 'upload', 'shutdown', 'kick', 'users'
         ];
         
         if (in_array($command, $admin_commands) && $user['role'] !== 'admin') {
             return [
                 'allowed' => false,
                 'message' => "ERROR: ADMIN privileges required for /$command command"
+            ];
+        }
+        
+        // Check if read-only user has permission for this command
+        if ($user['role'] === 'read' && !$this->has_permission($client_id, $command)) {
+            return [
+                'allowed' => false,
+                'message' => "ERROR: Insufficient permissions for /$command command"
             ];
         }
         
@@ -156,8 +188,11 @@ class UserAuthenticator {
     public function logout($client_id) {
         if (isset($this->user_sessions[$client_id])) {
             $username = $this->user_sessions[$client_id]['username'];
+            $session_duration = time() - $this->user_sessions[$client_id]['authenticated_at'];
             unset($this->user_sessions[$client_id]);
-            log_message("Client #$client_id (user: $username) logged out", 'INFO');
+            
+            log_message("Client #$client_id (user: $username) logged out after " . 
+                       $this->format_duration($session_duration) . " session", 'INFO');
             return true;
         }
         return false;
@@ -168,15 +203,49 @@ class UserAuthenticator {
     }
     
     public function get_user_count() {
+        $admins = 0;
+        $read_only = 0;
+        
+        foreach ($this->user_sessions as $user) {
+            if ($user['role'] === 'admin') {
+                $admins++;
+            } else {
+                $read_only++;
+            }
+        }
+        
         return [
             'total' => count($this->user_sessions),
-            'admins' => count(array_filter($this->user_sessions, function($user) {
-                return $user['role'] === 'admin';
-            })),
-            'read_only' => count(array_filter($this->user_sessions, function($user) {
-                return $user['role'] === 'read';
-            }))
+            'admins' => $admins,
+            'read_only' => $read_only
         ];
+    }
+    
+    public function get_user_stats() {
+        $stats = [
+            'total_users' => count($this->user_sessions),
+            'admins' => 0,
+            'read_only' => 0,
+            'sessions' => []
+        ];
+        
+        foreach ($this->user_sessions as $client_id => $user) {
+            if ($user['role'] === 'admin') {
+                $stats['admins']++;
+            } else {
+                $stats['read_only']++;
+            }
+            
+            $stats['sessions'][] = [
+                'client_id' => $client_id,
+                'username' => $user['username'],
+                'role' => $user['role'],
+                'session_duration' => time() - $user['authenticated_at'],
+                'last_activity' => $user['last_activity']
+            ];
+        }
+        
+        return $stats;
     }
     
     public function cleanup_inactive_sessions($timeout_seconds = 7200) { // 2 hours default
@@ -185,13 +254,68 @@ class UserAuthenticator {
         
         foreach ($this->user_sessions as $client_id => $session) {
             if ($current_time - $session['last_activity'] > $timeout_seconds) {
-                log_message("Removed inactive session for client #$client_id (user: {$session['username']})", 'INFO');
+                $username = $session['username'];
+                $session_duration = $current_time - $session['authenticated_at'];
+                
+                log_message("Removed inactive session for client #$client_id (user: $username) after " . 
+                           $this->format_duration($session_duration) . " inactivity", 'INFO');
                 unset($this->user_sessions[$client_id]);
                 $removed_count++;
             }
         }
         
         return $removed_count;
+    }
+    
+    public function force_logout($client_id) {
+        if (isset($this->user_sessions[$client_id])) {
+            $username = $this->user_sessions[$client_id]['username'];
+            unset($this->user_sessions[$client_id]);
+            log_message("Forcefully logged out client #$client_id (user: $username)", 'WARNING');
+            return true;
+        }
+        return false;
+    }
+    
+    public function change_user_role($client_id, $new_role) {
+        if (!isset($this->user_sessions[$client_id])) {
+            return false;
+        }
+        
+        $valid_roles = ['admin', 'read'];
+        if (!in_array($new_role, $valid_roles)) {
+            return false;
+        }
+        
+        $old_role = $this->user_sessions[$client_id]['role'];
+        $username = $this->user_sessions[$client_id]['username'];
+        
+        $this->user_sessions[$client_id]['role'] = $new_role;
+        
+        log_message("Changed role for client #$client_id (user: $username) from $old_role to $new_role", 'INFO');
+        return true;
+    }
+    
+    private function format_duration($seconds) {
+        if ($seconds < 60) {
+            return "$seconds seconds";
+        } elseif ($seconds < 3600) {
+            $minutes = floor($seconds / 60);
+            $remaining_seconds = $seconds % 60;
+            return "$minutes minutes, $remaining_seconds seconds";
+        } else {
+            $hours = floor($seconds / 3600);
+            $minutes = floor(($seconds % 3600) / 60);
+            $remaining_seconds = $seconds % 60;
+            return "$hours hours, $minutes minutes, $remaining_seconds seconds";
+        }
+    }
+    
+    public function __destruct() {
+        $session_count = count($this->user_sessions);
+        if ($session_count > 0) {
+            log_message("UserAuthenticator shutting down with $session_count active sessions", 'INFO');
+        }
     }
 }
 
@@ -224,9 +348,13 @@ function get_user_summary($authenticator) {
         $summary .= "\nActive Users:\n";
         foreach ($active_users as $client_id => $user) {
             $session_duration = time() - $user['authenticated_at'];
+            $inactive_time = time() - $user['last_activity'];
             $summary .= "  Client #$client_id - {$user['username']} ({$user['role']}) - ";
-            $summary .= "Session: " . format_duration($session_duration) . "\n";
+            $summary .= "Session: " . format_duration($session_duration) . " - ";
+            $summary .= "Inactive: " . format_duration($inactive_time) . "\n";
         }
+    } else {
+        $summary .= "\nNo active authenticated users.\n";
     }
     
     return $summary;
@@ -247,15 +375,54 @@ function format_duration($seconds) {
 
 // Command help system
 function get_auth_help() {
-    $help = "AUTHENTICATION HELP:\n";
+    $help = "AUTHENTICATION & COMMANDS HELP\n";
+    $help .= str_repeat("=", 50) . "\n\n";
+    
+    $help .= "AUTHENTICATION COMMANDS:\n";
     $help .= "/auth <username>              - Authenticate as read-only user\n";
     $help .= "/auth <username> <password>   - Authenticate as admin user\n";
     $help .= "/logout                       - Log out from current session\n";
     $help .= "/whoami                       - Show current user information\n";
-    $help .= "/users                        - List all authenticated users (admin only)\n";
-    $help .= "\n";
-    $help .= "READ-ONLY users can: echo messages, view stats, use help\n";
-    $help .= "ADMIN users can: manage files, view all users, use all commands\n";
+    $help .= "/users                        - List all authenticated users (admin only)\n\n";
+    
+    $help .= "SERVER COMMANDS:\n";
+    $help .= "STATS                         - Show server statistics\n";
+    $help .= "/help                         - Show this help message\n";
+    $help .= "quit / exit                   - Disconnect from server\n\n";
+    
+    $help .= "FILE COMMANDS (Admin only):\n";
+    $help .= "/list                         - List all files on server\n";
+    $help .= "/upload <filename>            - Upload a file to server\n";
+    $help .= "/download <filename>          - Download a file from server\n";
+    $help .= "/read <filename>              - View file content\n";
+    $help .= "/delete <filename>            - Delete a file\n";
+    $help .= "/search <keyword>             - Search for files\n";
+    $help .= "/info <filename>              - Get file information\n\n";
+    
+    $help .= "PERMISSIONS:\n";
+    $help .= "READ-ONLY users can: echo messages, view stats, use help, authenticate\n";
+    $help .= "ADMIN users can: manage files, view all users, use all commands\n\n";
+    
+    $help .= "EXAMPLES:\n";
+    $help .= "  /auth guest                 -> Read-only access\n";
+    $help .= "  /auth admin sekrete123      -> Admin access\n";
+    $help .= "  /whoami                     -> Show your user info\n";
+    $help .= "  STATS                       -> Server statistics\n";
     
     return $help;
+}
+
+// Utility function to check if a string is an authentication command
+function is_auth_command($data) {
+    $auth_commands = [
+        '/auth', '/logout', '/whoami', '/users', '/help'
+    ];
+    
+    foreach ($auth_commands as $cmd) {
+        if (stripos($data, $cmd) === 0) {
+            return true;
+        }
+    }
+    
+    return false;
 }
